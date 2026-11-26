@@ -21,6 +21,7 @@ class Payment(Base):
     kes_amount: Mapped[int] = mapped_column(Integer, nullable=False)
     sats: Mapped[int] = mapped_column(BigInteger, nullable=False)
     bolt11: Mapped[str | None] = mapped_column(String, nullable=True)
+    lightning_invoice_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[PaymentStatus] = mapped_column(
         SqlEnum(PaymentStatus, name="payment_status", native_enum=False),
         nullable=False,
@@ -39,3 +40,10 @@ class Payment(Base):
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AirtimeReward(Base):
+    __tablename__ = "airtime_rewards"
+
+    tourist_phone: Mapped[str] = mapped_column(String(32), primary_key=True)
+    last_reward_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

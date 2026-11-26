@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     merchant_phone: str = ""
     lnbits_url: str = "http://127.0.0.1:5000"
     lnbits_api_key: str = ""
-    airtime_reward_kes: Decimal = Field(default=Decimal("20"), gt=0)
+    airtime_reward_kes: int = Field(default=20, gt=0)
     quote_ttl_minutes: int = Field(default=15, gt=0)
     kes_per_btc_fallback: Decimal = Field(gt=0)
 
