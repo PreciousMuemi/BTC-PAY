@@ -14,7 +14,13 @@ from app.db import SessionLocal
 from app.models import Payment, PaymentStatus
 from app.services.at import normalize_phone
 from app.services.lightning import MockLightning, lightning
-from app.services.payments import expire_if_due, get_payment, settle
+from app.services.payments import (
+    expire_if_due,
+    get_payment,
+    mark_payout_failed,
+    mark_payout_success,
+    settle,
+)
 from app.services.rates import kes_to_sats
 
 
@@ -70,7 +76,7 @@ async def checkout(request: Request, body: CheckoutRequest) -> dict[str, object]
         kes_amount=body.kes_amount,
         sats=sats,
         bolt11=bolt11,
-        lightning_invoice_id=invoice_id,
+        invoice_id=invoice_id,
         status=PaymentStatus.PENDING,
         tourist_phone=tourist_phone,
         merchant_target=settings.merchant_mpesa_target,
@@ -99,10 +105,13 @@ async def payment_status(payment_id: UUID) -> dict[str, object]:
     if payment is None:
         raise HTTPException(status_code=404, detail="Payment not found")
 
-    if payment["status"] == PaymentStatus.PENDING.value and not settings.mock_lightning:
+    if (
+        payment["status"] == PaymentStatus.PENDING.value
+        and settings.lightning_provider == "blink"
+    ):
         with SessionLocal() as session:
             record = session.get(Payment, payment_id)
-            invoice_id = record.lightning_invoice_id if record is not None else None
+            invoice_id = record.invoice_id if record is not None else None
         if invoice_id:
             try:
                 is_paid = await run_in_threadpool(lightning.check_paid, invoice_id)
@@ -140,7 +149,48 @@ async def lightning_paid(
     return payment
 
 
-if settings.mock_lightning:
+@router.post("/mpesa/result/{token}")
+async def b2c_result(token: str, payload: dict[str, object]) -> dict[str, object]:
+    callback_token = settings.mpesa_callback_token.get_secret_value()
+    if not callback_token or not hmac.compare_digest(token, callback_token):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    result = payload.get("Result")
+    if not isinstance(result, dict):
+        return {"ResultCode": 0, "ResultDesc": "Accepted"}
+    originator_id = result.get("OriginatorConversationID")
+    try:
+        payment_id = UUID(str(originator_id))
+    except (ValueError, TypeError, AttributeError):
+        return {"ResultCode": 0, "ResultDesc": "Accepted"}
+
+    result_code = result.get("ResultCode")
+    if str(result_code) == "0":
+        transaction_id = result.get("TransactionID")
+        if isinstance(transaction_id, str) and transaction_id:
+            await mark_payout_success(
+                payment_id,
+                transaction_id,
+                simulated=settings.payout_mode == "daraja_sandbox",
+            )
+    else:
+        description = result.get("ResultDesc")
+        if not isinstance(description, str):
+            description = "M-Pesa payout failed."
+        await mark_payout_failed(payment_id, description)
+
+    return {"ResultCode": 0, "ResultDesc": "Accepted"}
+
+
+@router.post("/mpesa/timeout/{token}")
+async def b2c_timeout(token: str) -> dict[str, object]:
+    callback_token = settings.mpesa_callback_token.get_secret_value()
+    if not callback_token or not hmac.compare_digest(token, callback_token):
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"ResultCode": 0, "ResultDesc": "Accepted"}
+
+
+if settings.lightning_provider == "mock":
 
     @router.post("/demo/simulate-paid")
     async def simulate_paid(body: WebhookRequest) -> dict[str, object]:
@@ -159,7 +209,7 @@ if settings.mock_lightning:
 
         with SessionLocal() as session:
             record = session.get(Payment, body.payment_id)
-            invoice_id = record.lightning_invoice_id if record is not None else None
+            invoice_id = record.invoice_id if record is not None else None
         if not invoice_id or not isinstance(lightning, MockLightning):
             raise HTTPException(status_code=409, detail="Mock invoice is unavailable")
         try:

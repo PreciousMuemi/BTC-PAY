@@ -14,6 +14,13 @@ class PaymentStatus(str, Enum):
     EXPIRED = "EXPIRED"
 
 
+class PayoutStatus(str, Enum):
+    NONE = "NONE"
+    PENDING = "PENDING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+
+
 class Payment(Base):
     __tablename__ = "payments"
 
@@ -21,12 +28,18 @@ class Payment(Base):
     kes_amount: Mapped[int] = mapped_column(Integer, nullable=False)
     sats: Mapped[int] = mapped_column(BigInteger, nullable=False)
     bolt11: Mapped[str | None] = mapped_column(String, nullable=True)
-    lightning_invoice_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    invoice_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[PaymentStatus] = mapped_column(
         SqlEnum(PaymentStatus, name="payment_status", native_enum=False),
         nullable=False,
         default=PaymentStatus.PENDING,
     )
+    payout_status: Mapped[PayoutStatus] = mapped_column(
+        SqlEnum(PayoutStatus, name="payout_status", native_enum=False),
+        nullable=False,
+        default=PayoutStatus.NONE,
+    )
+    payout_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
     tourist_phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
     merchant_target: Mapped[str] = mapped_column(String(64), nullable=False)
     mpesa_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)

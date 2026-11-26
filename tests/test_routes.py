@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import sessionmaker
@@ -30,10 +31,12 @@ def api(monkeypatch):
     test_sessions = sessionmaker(bind=database, autoflush=False, autocommit=False)
     monkeypatch.setattr("app.routes.SessionLocal", test_sessions)
     monkeypatch.setattr("app.services.payments.SessionLocal", test_sessions)
-    monkeypatch.setattr(settings, "mock_lightning", True)
+    monkeypatch.setattr(settings, "lightning_provider", "mock")
+    monkeypatch.setattr(settings, "payout_mode", "simulated")
     monkeypatch.setattr(settings, "merchant_mpesa_target", "254700000000")
     monkeypatch.setattr(settings, "merchant_phone", "254700000001")
     monkeypatch.setattr(settings, "webhook_secret", "test-secret")
+    monkeypatch.setattr(settings, "mpesa_callback_token", SecretStr("callback-secret"))
     monkeypatch.setattr(settings, "quote_ttl_minutes", 15)
     monkeypatch.setattr(settings, "airtime_reward_kes", 20)
     mock_lightning = MockLightning()
@@ -57,7 +60,7 @@ def _create_payment(session_factory, tourist_phone: str, expires_at: datetime):
         kes_amount=100,
         sats=1000,
         bolt11=bolt11,
-        lightning_invoice_id=invoice_id,
+        invoice_id=invoice_id,
         tourist_phone=tourist_phone,
         merchant_target="254700000000",
         expires_at=expires_at,
@@ -99,7 +102,7 @@ def test_checkout_and_demo_settlement_are_idempotent(api) -> None:
         payment = session.get(Payment, UUID(payload["payment_id"]))
         assert payment is not None
         assert payment.merchant_target == "254700000000"
-        assert mock_lightning.check_paid(payment.lightning_invoice_id)
+        assert mock_lightning.check_paid(payment.invoice_id)
 
 
 def test_webhook_secret_is_required_and_valid_webhook_settles(api) -> None:
@@ -124,6 +127,114 @@ def test_webhook_secret_is_required_and_valid_webhook_settles(api) -> None:
     assert denied.status_code == 401
     assert settled.status_code == 200
     assert settled.json()["status"] == PaymentStatus.SETTLED.value
+
+
+def test_daraja_payout_waits_for_result_and_is_idempotent(api, monkeypatch) -> None:
+    client, session_factory, _ = api
+    monkeypatch.setattr(settings, "payout_mode", "daraja_sandbox")
+    submissions: list[tuple[str, int, str]] = []
+    sms_calls: list[dict[str, object]] = []
+
+    def send_kes(phone: str, kes: int, payment_id: str) -> dict[str, object]:
+        submissions.append((phone, kes, payment_id))
+        return {"ResponseCode": "0"}
+
+    async def record_sms(*args, **kwargs) -> bool:
+        sms_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(payments.daraja_b2c, "send_kes", send_kes)
+    monkeypatch.setattr(payments, "send_sms", record_sms)
+    payment_id, _ = _create_payment(
+        session_factory,
+        "+254712345678",
+        datetime.now(UTC) + timedelta(minutes=5),
+    )
+    settled = client.post(
+        "/api/webhook/lightning-paid",
+        json={"payment_id": str(payment_id)},
+        headers={"X-Webhook-Secret": "test-secret"},
+    )
+
+    assert settled.status_code == 200
+    assert settled.json()["payout_status"] == "PENDING"
+    assert submissions == [("254700000000", 100, str(payment_id))]
+
+    result_payload = {
+        "Result": {
+            "OriginatorConversationID": str(payment_id),
+            "ResultCode": 0,
+            "TransactionID": "QK12345",
+        },
+    }
+    callback = client.post(
+        "/api/mpesa/result/callback-secret",
+        json=result_payload,
+    )
+    duplicate = client.post(
+        "/api/mpesa/result/callback-secret",
+        json=result_payload,
+    )
+
+    assert callback.status_code == duplicate.status_code == 200
+    assert callback.json()["ResultCode"] == 0
+    payment = client.get(f"/api/payments/{payment_id}").json()
+    assert payment["payout_status"] == "SUCCESS"
+    assert payment["mpesa_ref"] == "QK12345"
+    assert payment["sms_sent"] is True
+    assert payment["merchant_sms_sent"] is True
+    assert payment["airtime_sent"] is True
+    assert len(sms_calls) == 2
+    assert all(call["mpesa_simulated"] is True for call in sms_calls)
+    assert submissions == [("254700000000", 100, str(payment_id))]
+
+
+def test_daraja_failed_callback_is_visible(api, monkeypatch) -> None:
+    client, session_factory, _ = api
+    monkeypatch.setattr(settings, "payout_mode", "daraja_sandbox")
+    monkeypatch.setattr(
+        payments.daraja_b2c,
+        "send_kes",
+        lambda *args: {"ResponseCode": "0"},
+    )
+    payment_id, _ = _create_payment(
+        session_factory,
+        "+254712345678",
+        datetime.now(UTC) + timedelta(minutes=5),
+    )
+    client.post(
+        "/api/webhook/lightning-paid",
+        json={"payment_id": str(payment_id)},
+        headers={"X-Webhook-Secret": "test-secret"},
+    )
+
+    callback = client.post(
+        "/api/mpesa/result/callback-secret",
+        json={
+            "Result": {
+                "OriginatorConversationID": str(payment_id),
+                "ResultCode": 1,
+                "ResultDesc": "Insufficient balance",
+            },
+        },
+    )
+    payment = client.get(f"/api/payments/{payment_id}").json()
+
+    assert callback.status_code == 200
+    assert payment["payout_status"] == "FAILED"
+    assert payment["payout_error"] == "Insufficient balance"
+    assert payment["mpesa_ref"] is None
+
+
+def test_daraja_callback_rejects_bad_token(api) -> None:
+    client, _, _ = api
+
+    response = client.post(
+        "/api/mpesa/result/wrong",
+        json={"Result": {}},
+    )
+
+    assert response.status_code == 404
 
 
 def test_expired_payment_is_not_settled(api) -> None:
@@ -152,7 +263,7 @@ def test_live_lightning_poll_settles_paid_payment(api, monkeypatch) -> None:
         def check_paid(self, invoice_id: str) -> bool:
             return True
 
-    monkeypatch.setattr(settings, "mock_lightning", False)
+    monkeypatch.setattr(settings, "lightning_provider", "blink")
     monkeypatch.setattr("app.routes.lightning", PaidLightning())
 
     response = client.get(f"/api/payments/{payment_id}")

@@ -108,7 +108,10 @@ async def send_sms(
     try:
         phone = normalize_phone(to)
         body = _fit_gsm_sms(message, mpesa_simulated)
-        sms_client, _ = _at_clients(settings.at_username, settings.at_api_key)
+        sms_client, _ = _at_clients(
+            settings.at_username,
+            settings.at_api_key.get_secret_value(),
+        )
         response = await run_in_threadpool(sms_client.send, body, [phone])
         if not _sms_succeeded(response):
             logger.warning("Africa's Talking did not confirm SMS delivery")
@@ -124,7 +127,10 @@ async def send_airtime(phone: str, kes: int) -> bool:
         normalized_phone = normalize_phone(phone)
         if not isinstance(kes, int) or isinstance(kes, bool) or kes <= 0:
             raise ValueError("Airtime amount must be a positive whole number of KES")
-        _, airtime_client = _at_clients(settings.at_username, settings.at_api_key)
+        _, airtime_client = _at_clients(
+            settings.at_username,
+            settings.at_api_key.get_secret_value(),
+        )
         response = await run_in_threadpool(
             airtime_client.send,
             phone_number=normalized_phone,
